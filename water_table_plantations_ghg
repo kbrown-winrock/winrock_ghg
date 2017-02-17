@@ -1,0 +1,114 @@
+import arcpy, os, helper_utilities as utl
+for i in sys.path:
+    print i
+
+"""
+Conducts a zonal statistic on a raster layer, renames the resulting
+statistics column, and then joins it to the master results table. It
+returns the file name of the resulting renames statistics field
+for use in further field calculator operation.
+"""
+def zonal_join(results_table,zones,zonal_field,raster,stat,tag,month):
+    #defauly field name resulting from zonal stat based on statistic choice
+    zonal_stat_field_names={'MAXIMUM':'MAX','MEAN':'MEAN'}
+
+    #conduct zonal statistic
+    zonal_table_out = ''.join([tag,month,'zonal'])
+
+    utl.msg(['zonal stats: ',zones,zonal_field,raster,zonal_table_out,"NODATA",stat])
+    arcpy.sa.ZonalStatisticsAsTable(zones,zonal_field,raster,zonal_table_out,"NODATA",stat)
+
+    #rename statistic fied to somethign unique
+    field_new = tag+'_'+month
+
+    utl.msg(['rename field: ',zonal_table_out,zonal_stat_field_names[stat],field_new])
+    utl.rename_field(zonal_table_out,zonal_stat_field_names[stat],field_new)
+
+    #join the renamed statistic field to main results table
+
+    utl.msg(['join field: ',results_table,zonal_field,zonal_table_out,zonal_field,field_new])
+    arcpy.JoinField_management(results_table,zonal_field,zonal_table_out,zonal_field,fields=field_new)
+
+    utl.msg(['delete: ',zonal_table_out])
+    arcpy.Delete_management(zonal_table_out)
+
+    return field_new
+
+"""
+PPWT: input PPWT point shapefile (point feature)
+LUmap: polygon shapefile with zonal statistic unit (polygon feature)
+results_path: directory to store results (workspace)
+year: year of data (short)
+EF: emission factor (double)
+
+"""
+def run(PPWT,LUmap,LUmap_field,results_path,year,EF_slope,EF_intercept):
+
+    arcpy.env.workspace = results_path
+    arcpy.env.extent = LUmap
+
+    months = {'jan':31,'feb':28.25,'mar':31,'apr':30,'may':31,'jun':30,'jul':31,'aug':31,'sep':30,'oct':31,'nov':30,'dec':31}
+
+    ghg_fields = []
+
+    #create report_table for the year
+
+    results_table = '_'.join(['water_table',year])
+    utl.msg(['table to table: ',LUmap,results_path,results_table])
+    arcpy.TableToTable_conversion(LUmap,results_path,results_table)
+
+    #for each month (someone already created 12 fields expressing measurement just for that month)
+    for field in arcpy.ListFields(PPWT):
+        if field.name in months:
+            month = field.name
+            """
+            in_point_features,
+            z_field,
+            kriging_model, (700m chosen as good 'average nearast neighbor' for clustered areas, based on ESRI recommendations)
+            {cell_size}, (100m is reasonable)
+            {search_radius}, (variable)
+            {out_variance_prediction_raster}
+            """
+            #kriging for this month's mean depth to create a varance and depth surface
+
+            variance_surface = ''.join(['var',month])
+            depth_surface = ''.join(['depth',month])
+
+            kriging_args=['kriging: ',PPWT,month,'Spherical 700',100,'VARIABLE 12',variance_surface]
+            utl.msg(['kriging: ',PPWT,month,'Spherical 700',100,'VARIABLE 12',variance_surface])
+            arcpy.sa.Kriging(PPWT,month,'Spherical 700',100,'VARIABLE 12',variance_surface).save(depth_surface)
+
+            #zonal statistic for each raster, summary column joined to results table by COMPT_ID
+            depth_field = zonal_join(results_table,LUmap,LUmap_field,depth_surface,'MEAN','depth',month)
+            #zonal_join(results_table,LUmap,LUmap_field,variance_surface,'MAXIMUM','variance',month)
+
+            #Create a ghg field in results table, and calculate emissions
+            ghg_field = 'tco2e_' + month
+            ghg_fields.append(ghg_field)
+
+            utl.msg(['add field: ',results_table,ghg_field,'FLOAT'])
+            arcpy.AddField_management(results_table,ghg_field,'FLOAT')
+
+            #emissions scaled to the number of days per month
+            field_op = 'round(({2} - -({3}/100.) * !{1}!) * ( {4} / 365.25) * !{0}!,2)'.format('area_ha',depth_field,EF_intercept,EF_slope,months[month])
+
+            utl.msg(['field calculator: ',results_table,ghg_field,field_op,'PYTHON_9.3','#'])
+            arcpy.CalculateField_management(results_table,ghg_field,field_op,'PYTHON_9.3','#')
+
+            for f in [variance_surface,depth_surface]:
+                utl.msg(['delete',f])
+                arcpy.Delete_management(f)
+
+    total_ghg_field = 'tCO2_total'
+    utl.msg(['add field: ',results_table,total_ghg_field,'FLOAT'])
+    arcpy.AddField_management(results_table,total_ghg_field,'FLOAT')
+
+    field_op = '!' + '!+!'.join(ghg_fields)+'!'
+    utl.msg(['field calculator: ',results_table,total_ghg_field,field_op,'PYTHON_9.3','#'])
+    arcpy.CalculateField_management(results_table,total_ghg_field,field_op,'PYTHON_9.3','#')
+
+if __name__ == '__main__':
+    argv = tuple(arcpy.GetParameterAsText(i)
+        for i in range(arcpy.GetArgumentCount()))
+    run(*argv)
+    utl.msg(['COMPLETE'])
